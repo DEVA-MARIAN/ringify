@@ -49,7 +49,7 @@ export async function extractAudio(url: string, outputId: string): Promise<Extra
     return extractYouTube(url, outputId, outputPath, ffmpegPath);
   }
 
-  throw new Error('Only YouTube is supported on the hosted version. For Spotify/SoundCloud, run locally.');
+  throw new Error('Only YouTube is supported on the hosted version. For other platforms, run locally.');
 }
 
 async function extractYouTube(url: string, outputId: string, outputPath: string, ffmpegPath: string): Promise<ExtractionResult> {
@@ -57,21 +57,29 @@ async function extractYouTube(url: string, outputId: string, outputPath: string,
   const ffmpeg = require('fluent-ffmpeg');
   ffmpeg.setFfmpegPath(ffmpegPath);
 
-  // Get video info
-  const info = await ytdl.getInfo(url);
+  const agent = ytdl.createProxyAgent({ uri: 'https://www.youtube.com' });
+
+  const info = await ytdl.getInfo(url, {
+    agent,
+    requestOptions: {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+    },
+  });
+
   const title = info.videoDetails.title || 'Unknown Track';
   const duration = parseInt(info.videoDetails.lengthSeconds) || 0;
 
-  // Get best audio format
   const audioFormat = ytdl.chooseFormat(info.formats, {
     quality: 'highestaudio',
     filter: 'audioonly',
   });
 
-  // Download and convert to mp3
   await new Promise<void>((resolve, reject) => {
     const audioStream = ytdl.downloadFromInfo(info, { format: audioFormat });
-
     ffmpeg(audioStream)
       .audioBitrate(320)
       .audioFrequency(44100)
