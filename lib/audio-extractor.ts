@@ -1,8 +1,6 @@
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import https from 'https';
-import http from 'http';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -35,129 +33,7 @@ function getFfmpegPath(): string {
   return 'ffmpeg';
 }
 
-function extractVideoId(url: string): string | null {
-  const patterns = [
-    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
-    /youtube\.com\/embed\/([a-zA-Z0-9_-]{11})/,
-  ];
-  for (const p of patterns) { const m = url.match(p); if (m) return m[1]; }
-  return null;
-}
-
-function fetchJson(url: string, timeout = 10000): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const client = url.startsWith('https') ? https : http;
-    const req = client.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json',
-      }
-    }, (res) => {
-      if (res.statusCode === 301 || res.statusCode === 302) {
-        fetchJson(res.headers.location!, timeout).then(resolve).catch(reject);
-        return;
-      }
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch { reject(new Error(`Invalid JSON from ${url}: ${data.substring(0, 100)}`)); }
-      });
-    });
-    req.setTimeout(timeout, () => { req.destroy(); reject(new Error('Timeout')); });
-    req.on('error', reject);
-  });
-}
-
-function downloadFile(url: string, dest: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const client = url.startsWith('https') ? https : http;
-    const file = fs.createWriteStream(dest);
-    const request = client.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://piped.video/',
-      }
-    }, (res) => {
-      if (res.statusCode === 301 || res.statusCode === 302) {
-        file.close();
-        fs.unlink(dest, () => {});
-        downloadFile(res.headers.location!, dest).then(resolve).catch(reject);
-        return;
-      }
-      res.pipe(file);
-      file.on('finish', () => file.close(() => resolve()));
-    });
-    request.on('error', (err) => { fs.unlink(dest, () => {}); reject(err); });
-    file.on('error', (err) => { fs.unlink(dest, () => {}); reject(err); });
-  });
-}
-
-const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://piped-api.garudalinux.org',
-  'https://api.piped.yt',
-  'https://piped.syncpundit.io/api',
-  'https://piped.video/api',
-  'https://api.piped.projectsegfau.lt',
-  'https://pipedapi.tokhmi.xyz',
-  'https://pipedapi.moomoo.me',
-];
-
-async function extractYouTubeViaPiped(url: string, outputId: string): Promise<ExtractionResult> {
-  const videoId = extractVideoId(url);
-  if (!videoId) throw new Error('Could not extract YouTube video ID');
-
-  const tempDir = getTempDir();
-  const tempAudio = path.join(tempDir, `${outputId}.webm`);
-  const finalMp3 = path.join(tempDir, `${outputId}.mp3`);
-  const ffmpegPath = getFfmpegPath();
-
-  let videoData: any = null;
-  let lastError = '';
-
-  for (const instance of PIPED_INSTANCES) {
-    try {
-      console.log(`[piped] Trying ${instance}/streams/${videoId}`);
-      const data = await fetchJson(`${instance}/streams/${videoId}`, 8000);
-      if (data && data.audioStreams && data.audioStreams.length > 0) {
-        videoData = data;
-        console.log(`[piped] Success with ${instance}`);
-        break;
-      }
-    } catch (err: any) {
-      lastError = err.message;
-      console.log(`[piped] Failed ${instance}: ${err.message}`);
-    }
-  }
-
-  if (!videoData || !videoData.audioStreams?.length) {
-    throw new Error(`All Piped instances failed. Last error: ${lastError}`);
-  }
-
-  const audioStreams = videoData.audioStreams.sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0));
-  const bestAudio = audioStreams[0];
-  console.log(`[piped] Downloading: ${bestAudio.mimeType} ${bestAudio.bitrate}bps`);
-
-  await downloadFile(bestAudio.url, tempAudio);
-
-  await execFileAsync(ffmpegPath, [
-    '-y', '-i', tempAudio,
-    '-codec:a', 'libmp3lame', '-b:a', '320k', '-ar', '44100', '-ac', '2',
-    finalMp3
-  ], { timeout: 120000 });
-
-  try { fs.unlinkSync(tempAudio); } catch {}
-
-  return {
-    filePath: finalMp3,
-    title: videoData.title || 'Unknown Track',
-    duration: videoData.duration || 0,
-    platform: 'YouTube'
-  };
-}
-
-async function extractWithYtDlp(url: string, outputId: string, platform: string, extraArgs: string[] = []): Promise<ExtractionResult> {
+async function runYtDlp(url: string, outputId: string, platform: string, extraArgs: string[] = []): Promise<ExtractionResult> {
   const tempDir = getTempDir();
   const outputTemplate = path.join(tempDir, `${outputId}.%(ext)s`);
   const finalMp3 = path.join(tempDir, `${outputId}.mp3`);
@@ -167,13 +43,19 @@ async function extractWithYtDlp(url: string, outputId: string, platform: string,
     url,
     '--output', outputTemplate,
     '--format', 'bestaudio/best',
-    '--extract-audio', '--audio-format', 'mp3',
-    '--audio-quality', '0', '--no-playlist', '--no-warnings', '--print-json',
+    '--extract-audio',
+    '--audio-format', 'mp3',
+    '--audio-quality', '0',
+    '--no-playlist',
+    '--no-warnings',
+    '--print-json',
     '--ffmpeg-location', ffmpegPath,
     '--postprocessor-args', 'ffmpeg:-ar 44100 -b:a 320k',
-    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     ...extraArgs,
   ];
+
+  console.log(`[yt-dlp] Running for ${platform}: ${url.substring(0, 60)}`);
 
   let metadata: any = {};
   try {
@@ -181,60 +63,111 @@ async function extractWithYtDlp(url: string, outputId: string, platform: string,
     const lines = stdout.trim().split('\n').filter(Boolean);
     for (let i = lines.length - 1; i >= 0; i--) { try { metadata = JSON.parse(lines[i]); break; } catch {} }
   } catch (err: any) {
+    console.log(`[yt-dlp] Error: ${err.message}`);
     if (!fs.existsSync(finalMp3)) {
       const files = fs.readdirSync(tempDir).filter(f => f.startsWith(outputId) && f.endsWith('.mp3'));
-      if (!files.length) throw new Error(`Extraction failed: ${err.message}`);
+      if (!files.length) throw new Error(err.stderr || err.message || 'Extraction failed');
     }
   }
 
-  return { filePath: finalMp3, title: metadata.title || 'Unknown Track', duration: metadata.duration || 0, platform };
-}
+  if (!fs.existsSync(finalMp3)) throw new Error('Audio file was not created');
 
-async function extractSpotify(url: string, outputId: string): Promise<ExtractionResult> {
-  // Extract track info from Spotify oEmbed API (no auth needed)
-  try {
-    const oembedData = await fetchJson(`https://open.spotify.com/oembed?url=${encodeURIComponent(url)}`, 8000);
-    const trackName = oembedData.title || '';
-    console.log(`[spotify] Track name: ${trackName}`);
-
-    if (trackName) {
-      // Search YouTube for the track and download it
-      return extractWithYtDlp(
-        `ytsearch1:${trackName} official audio`,
-        outputId,
-        'Spotify',
-        ['--default-search', 'ytsearch']
-      );
-    }
-  } catch (err: any) {
-    console.log(`[spotify] oEmbed failed: ${err.message}`);
-  }
-
-  // Fallback: try direct yt-dlp with Spotify URL
-  return extractWithYtDlp(url, outputId, 'Spotify');
+  return {
+    filePath: finalMp3,
+    title: metadata.title || metadata.track || 'Unknown Track',
+    duration: metadata.duration || 0,
+    platform,
+  };
 }
 
 export async function extractAudio(url: string, outputId: string): Promise<ExtractionResult> {
   const platform = detectPlatform(url);
-  console.log(`[extract] Platform: ${platform}, URL: ${url.substring(0, 60)}`);
+  console.log(`[extract] Platform: ${platform}`);
 
   switch (platform) {
-    case 'YouTube':
-      return extractYouTubeViaPiped(url, outputId);
-    case 'Spotify':
-      return extractSpotify(url, outputId);
-    case 'SoundCloud':
-      return extractWithYtDlp(url, outputId, 'SoundCloud');
-    case 'TikTok':
-      return extractWithYtDlp(url, outputId, 'TikTok');
-    case 'Instagram':
-      return extractWithYtDlp(url, outputId, 'Instagram');
-    case 'Apple Music': {
-      const trackName = url.split('/').pop()?.replace(/-/g, ' ') || '';
-      return extractWithYtDlp(`ytsearch1:${trackName}`, outputId, 'Apple Music', ['--default-search', 'ytsearch']);
+    case 'YouTube': {
+      // Try multiple player clients to bypass bot detection
+      const ytClients = [
+        ['--extractor-args', 'youtube:player_client=web_creator'],
+        ['--extractor-args', 'youtube:player_client=android'],
+        ['--extractor-args', 'youtube:player_client=ios'],
+        ['--extractor-args', 'youtube:player_client=web_embedded'],
+        [], // fallback: no extra args
+      ];
+      let lastErr = '';
+      for (const clientArgs of ytClients) {
+        try {
+          console.log(`[youtube] Trying client args: ${clientArgs.join(' ') || 'default'}`);
+          return await runYtDlp(url, outputId, 'YouTube', clientArgs);
+        } catch (err: any) {
+          lastErr = err.message;
+          console.log(`[youtube] Client failed: ${err.message}`);
+          // Clean up any partial files
+          try {
+            const tempDir = getTempDir();
+            fs.readdirSync(tempDir).filter(f => f.startsWith(outputId)).forEach(f => {
+              try { fs.unlinkSync(path.join(tempDir, f)); } catch {}
+            });
+          } catch {}
+        }
+      }
+      throw new Error(`YouTube extraction failed: ${lastErr}`);
     }
+
+    case 'Spotify': {
+      // Get track name from Spotify oEmbed then search YouTube
+      try {
+        const https = require('https');
+        const trackInfo = await new Promise<any>((resolve, reject) => {
+          const req = https.get(
+            `https://open.spotify.com/oembed?url=${encodeURIComponent(url)}`,
+            { headers: { 'User-Agent': 'Mozilla/5.0' } },
+            (res: any) => {
+              let data = '';
+              res.on('data', (c: any) => data += c);
+              res.on('end', () => { try { resolve(JSON.parse(data)); } catch { reject(new Error('Parse error')); } });
+            }
+          );
+          req.setTimeout(8000, () => { req.destroy(); reject(new Error('Timeout')); });
+          req.on('error', reject);
+        });
+        const trackName = trackInfo.title || '';
+        console.log(`[spotify] Searching YouTube for: ${trackName}`);
+        if (trackName) {
+          return await runYtDlp(
+            `ytsearch1:${trackName} audio`,
+            outputId, 'Spotify',
+            ['--default-search', 'ytsearch', '--extractor-args', 'youtube:player_client=android']
+          );
+        }
+      } catch (e: any) {
+        console.log(`[spotify] oEmbed failed: ${e.message}`);
+      }
+      // Fallback
+      return runYtDlp(url, outputId, 'Spotify');
+    }
+
+    case 'SoundCloud':
+      return runYtDlp(url, outputId, 'SoundCloud');
+
+    case 'TikTok':
+      return runYtDlp(url, outputId, 'TikTok', ['--extractor-args', 'tiktok:api_hostname=api22-normal-c-useast2a.tiktokv.com']);
+
+    case 'Instagram':
+      return runYtDlp(url, outputId, 'Instagram');
+
+    case 'Apple Music': {
+      const parts = url.split('/');
+      const trackSlug = parts[parts.length - 1]?.split('?')[0]?.replace(/-/g, ' ') || '';
+      return runYtDlp(
+        `ytsearch1:${trackSlug} apple music`,
+        outputId, 'Apple Music',
+        ['--default-search', 'ytsearch', '--extractor-args', 'youtube:player_client=android']
+      );
+    }
+
     default:
-      throw new Error('Unsupported platform');
+      throw new Error('Unsupported platform. Please use YouTube, Spotify, SoundCloud, Apple Music, Instagram or TikTok.');
   }
 }
 
