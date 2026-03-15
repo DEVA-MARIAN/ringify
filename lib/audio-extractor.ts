@@ -53,6 +53,7 @@ export async function extractAudio(url: string, outputId: string): Promise<Extra
     '--ffmpeg-location', ffmpegPath,
     '--postprocessor-args', 'ffmpeg:-ar 44100 -b:a 320k',
     '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    '--cookies', '/app/cookies.txt',
   ];
 
   let metadata: any = {};
@@ -74,3 +75,4 @@ export function cleanupFile(filePath: string): void { try { if (fs.existsSync(fi
 export function getTempFilePath(id: string, ext: string): string { return path.join(getTempDir(), `${id}.${ext}`); }
 export function fileToBase64(filePath: string): string { return fs.readFileSync(filePath).toString('base64'); }
 export function getFileSizeKB(filePath: string): number { try { return Math.round(fs.statSync(filePath).size / 1024); } catch { return 0; } }
+
