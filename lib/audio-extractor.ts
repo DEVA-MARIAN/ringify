@@ -3,6 +3,10 @@ import fs from 'fs';
 import os from 'os';
 import https from 'https';
 import http from 'http';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileAsync = promisify(execFile);
 
 export type PlatformName = 'YouTube' | 'Spotify' | 'SoundCloud' | 'Apple Music' | 'Instagram' | 'TikTok' | 'Unknown';
 export interface ExtractionResult { filePath: string; title: string; duration: number; platform: string; }
@@ -36,28 +40,32 @@ function extractVideoId(url: string): string | null {
     /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
     /youtube\.com\/embed\/([a-zA-Z0-9_-]{11})/,
   ];
-  for (const p of patterns) {
-    const m = url.match(p);
-    if (m) return m[1];
-  }
+  for (const p of patterns) { const m = url.match(p); if (m) return m[1]; }
   return null;
 }
 
-function fetchJson(url: string): Promise<any> {
+function fetchJson(url: string, timeout = 10000): Promise<any> {
   return new Promise((resolve, reject) => {
     const client = url.startsWith('https') ? https : http;
-    client.get(url, {
+    const req = client.get(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'application/json',
       }
     }, (res) => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        fetchJson(res.headers.location!, timeout).then(resolve).catch(reject);
+        return;
+      }
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch { reject(new Error('Invalid JSON response')); }
+        try { resolve(JSON.parse(data)); }
+        catch { reject(new Error(`Invalid JSON from ${url}: ${data.substring(0, 100)}`)); }
       });
-    }).on('error', reject);
+    });
+    req.setTimeout(timeout, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.on('error', reject);
   });
 }
 
@@ -73,6 +81,7 @@ function downloadFile(url: string, dest: string): Promise<void> {
     }, (res) => {
       if (res.statusCode === 301 || res.statusCode === 302) {
         file.close();
+        fs.unlink(dest, () => {});
         downloadFile(res.headers.location!, dest).then(resolve).catch(reject);
         return;
       }
@@ -85,10 +94,14 @@ function downloadFile(url: string, dest: string): Promise<void> {
 }
 
 const PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
   'https://piped-api.garudalinux.org',
   'https://api.piped.yt',
+  'https://piped.syncpundit.io/api',
   'https://piped.video/api',
-  'https://pipedapi.kavin.rocks',
+  'https://api.piped.projectsegfau.lt',
+  'https://pipedapi.tokhmi.xyz',
+  'https://pipedapi.moomoo.me',
 ];
 
 async function extractYouTubeViaPiped(url: string, outputId: string): Promise<ExtractionResult> {
@@ -106,8 +119,9 @@ async function extractYouTubeViaPiped(url: string, outputId: string): Promise<Ex
   for (const instance of PIPED_INSTANCES) {
     try {
       console.log(`[piped] Trying ${instance}/streams/${videoId}`);
-      videoData = await fetchJson(`${instance}/streams/${videoId}`);
-      if (videoData && videoData.audioStreams && videoData.audioStreams.length > 0) {
+      const data = await fetchJson(`${instance}/streams/${videoId}`, 8000);
+      if (data && data.audioStreams && data.audioStreams.length > 0) {
+        videoData = data;
         console.log(`[piped] Success with ${instance}`);
         break;
       }
@@ -117,65 +131,48 @@ async function extractYouTubeViaPiped(url: string, outputId: string): Promise<Ex
     }
   }
 
-  if (!videoData || !videoData.audioStreams || videoData.audioStreams.length === 0) {
-    throw new Error(`Could not fetch audio streams: ${lastError}`);
+  if (!videoData || !videoData.audioStreams?.length) {
+    throw new Error(`All Piped instances failed. Last error: ${lastError}`);
   }
 
-  // Pick best audio stream
   const audioStreams = videoData.audioStreams.sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0));
   const bestAudio = audioStreams[0];
-  console.log(`[piped] Best audio: ${bestAudio.mimeType} ${bestAudio.bitrate}bps`);
+  console.log(`[piped] Downloading: ${bestAudio.mimeType} ${bestAudio.bitrate}bps`);
 
-  // Download audio
   await downloadFile(bestAudio.url, tempAudio);
-
-  // Convert to MP3 using ffmpeg
-  const { execFile } = require('child_process');
-  const { promisify } = require('util');
-  const execFileAsync = promisify(execFile);
 
   await execFileAsync(ffmpegPath, [
     '-y', '-i', tempAudio,
-    '-codec:a', 'libmp3lame',
-    '-b:a', '320k',
-    '-ar', '44100',
-    '-ac', '2',
+    '-codec:a', 'libmp3lame', '-b:a', '320k', '-ar', '44100', '-ac', '2',
     finalMp3
   ], { timeout: 120000 });
 
-  // Cleanup temp audio
   try { fs.unlinkSync(tempAudio); } catch {}
 
-  const title = videoData.title || 'Unknown Track';
-  const duration = videoData.duration || 0;
-
-  return { filePath: finalMp3, title, duration, platform: 'YouTube' };
+  return {
+    filePath: finalMp3,
+    title: videoData.title || 'Unknown Track',
+    duration: videoData.duration || 0,
+    platform: 'YouTube'
+  };
 }
 
-export async function extractAudio(url: string, outputId: string): Promise<ExtractionResult> {
-  const platform = detectPlatform(url);
-
-  if (platform === 'YouTube') {
-    return extractYouTubeViaPiped(url, outputId);
-  }
-
-  // For other platforms, try yt-dlp
-  const { execFile } = require('child_process');
-  const { promisify } = require('util');
-  const execFileAsync = promisify(execFile);
+async function extractWithYtDlp(url: string, outputId: string, platform: string, extraArgs: string[] = []): Promise<ExtractionResult> {
   const tempDir = getTempDir();
   const outputTemplate = path.join(tempDir, `${outputId}.%(ext)s`);
   const finalMp3 = path.join(tempDir, `${outputId}.mp3`);
   const ffmpegPath = getFfmpegPath();
 
   const args = [
-    url, '--output', outputTemplate,
+    url,
+    '--output', outputTemplate,
     '--format', 'bestaudio/best',
     '--extract-audio', '--audio-format', 'mp3',
     '--audio-quality', '0', '--no-playlist', '--no-warnings', '--print-json',
     '--ffmpeg-location', ffmpegPath,
     '--postprocessor-args', 'ffmpeg:-ar 44100 -b:a 320k',
     '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    ...extraArgs,
   ];
 
   let metadata: any = {};
@@ -191,6 +188,54 @@ export async function extractAudio(url: string, outputId: string): Promise<Extra
   }
 
   return { filePath: finalMp3, title: metadata.title || 'Unknown Track', duration: metadata.duration || 0, platform };
+}
+
+async function extractSpotify(url: string, outputId: string): Promise<ExtractionResult> {
+  // Extract track info from Spotify oEmbed API (no auth needed)
+  try {
+    const oembedData = await fetchJson(`https://open.spotify.com/oembed?url=${encodeURIComponent(url)}`, 8000);
+    const trackName = oembedData.title || '';
+    console.log(`[spotify] Track name: ${trackName}`);
+
+    if (trackName) {
+      // Search YouTube for the track and download it
+      return extractWithYtDlp(
+        `ytsearch1:${trackName} official audio`,
+        outputId,
+        'Spotify',
+        ['--default-search', 'ytsearch']
+      );
+    }
+  } catch (err: any) {
+    console.log(`[spotify] oEmbed failed: ${err.message}`);
+  }
+
+  // Fallback: try direct yt-dlp with Spotify URL
+  return extractWithYtDlp(url, outputId, 'Spotify');
+}
+
+export async function extractAudio(url: string, outputId: string): Promise<ExtractionResult> {
+  const platform = detectPlatform(url);
+  console.log(`[extract] Platform: ${platform}, URL: ${url.substring(0, 60)}`);
+
+  switch (platform) {
+    case 'YouTube':
+      return extractYouTubeViaPiped(url, outputId);
+    case 'Spotify':
+      return extractSpotify(url, outputId);
+    case 'SoundCloud':
+      return extractWithYtDlp(url, outputId, 'SoundCloud');
+    case 'TikTok':
+      return extractWithYtDlp(url, outputId, 'TikTok');
+    case 'Instagram':
+      return extractWithYtDlp(url, outputId, 'Instagram');
+    case 'Apple Music': {
+      const trackName = url.split('/').pop()?.replace(/-/g, ' ') || '';
+      return extractWithYtDlp(`ytsearch1:${trackName}`, outputId, 'Apple Music', ['--default-search', 'ytsearch']);
+    }
+    default:
+      throw new Error('Unsupported platform');
+  }
 }
 
 export function cleanupFile(filePath: string): void { try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {} }
