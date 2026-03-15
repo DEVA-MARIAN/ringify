@@ -1,10 +1,6 @@
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-
-const execFileAsync = promisify(execFile);
 
 export type PlatformName = 'YouTube' | 'Spotify' | 'SoundCloud' | 'Apple Music' | 'Instagram' | 'TikTok' | 'Unknown';
 
@@ -45,51 +41,48 @@ function getFfmpegPath(): string {
 
 export async function extractAudio(url: string, outputId: string): Promise<ExtractionResult> {
   const tempDir = getTempDir();
-  const outputTemplate = path.join(tempDir, `${outputId}.%(ext)s`);
-  const finalMp3 = path.join(tempDir, `${outputId}.mp3`);
   const platform = detectPlatform(url);
+  const outputPath = path.join(tempDir, `${outputId}.mp3`);
   const ffmpegPath = getFfmpegPath();
 
-  // Use youtube-dl-exec which bundles yt-dlp as an npm package
-  const youtubeDl = require('youtube-dl-exec');
-
-  const options: Record<string, any> = {
-    output: outputTemplate,
-    format: 'bestaudio/best',
-    extractAudio: true,
-    audioFormat: 'mp3',
-    audioQuality: 0,
-    noPlaylist: true,
-    noWarnings: true,
-    printJson: true,
-    ffmpegLocation: ffmpegPath,
-    postprocessorArgs: 'ffmpeg:-ar 44100 -b:a 320k',
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-  };
-
-  let metadata: any = {};
-
-  try {
-    const result = await youtubeDl(url, options);
-    if (typeof result === 'object') metadata = result;
-  } catch (err: any) {
-    // Check if file was created despite error
-    if (!fs.existsSync(finalMp3)) {
-      const files = fs.readdirSync(tempDir).filter(
-        (f) => f.startsWith(outputId) && f.endsWith('.mp3')
-      );
-      if (files.length === 0) {
-        throw new Error(`Audio extraction failed: ${err.message || 'unknown error'}`);
-      }
-    }
+  if (platform === 'YouTube') {
+    return extractYouTube(url, outputId, outputPath, ffmpegPath);
   }
 
-  return {
-    filePath: finalMp3,
-    title: metadata.title || metadata.track || 'Unknown Track',
-    duration: metadata.duration || 0,
-    platform,
-  };
+  throw new Error('Only YouTube is supported on the hosted version. For Spotify/SoundCloud, run locally.');
+}
+
+async function extractYouTube(url: string, outputId: string, outputPath: string, ffmpegPath: string): Promise<ExtractionResult> {
+  const ytdl = require('@distube/ytdl-core');
+  const ffmpeg = require('fluent-ffmpeg');
+  ffmpeg.setFfmpegPath(ffmpegPath);
+
+  // Get video info
+  const info = await ytdl.getInfo(url);
+  const title = info.videoDetails.title || 'Unknown Track';
+  const duration = parseInt(info.videoDetails.lengthSeconds) || 0;
+
+  // Get best audio format
+  const audioFormat = ytdl.chooseFormat(info.formats, {
+    quality: 'highestaudio',
+    filter: 'audioonly',
+  });
+
+  // Download and convert to mp3
+  await new Promise<void>((resolve, reject) => {
+    const audioStream = ytdl.downloadFromInfo(info, { format: audioFormat });
+
+    ffmpeg(audioStream)
+      .audioBitrate(320)
+      .audioFrequency(44100)
+      .audioChannels(2)
+      .format('mp3')
+      .on('end', resolve)
+      .on('error', reject)
+      .save(outputPath);
+  });
+
+  return { filePath: outputPath, title, duration, platform: 'YouTube' };
 }
 
 export function cleanupFile(filePath: string): void {
