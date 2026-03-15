@@ -6,8 +6,8 @@
   "framework": "nextjs",
   "functions": {
     "pages/api/extract.ts": {
-      "maxDuration": 300,
-      "memory": 3008
+      "maxDuration": 60,
+      "memory": 1024
     },
     "pages/api/trim.ts": {
       "maxDuration": 60,
@@ -26,3 +26,5 @@
     "NEXT_PUBLIC_APP_URL": "https://your-app.vercel.app"
   }
 }
+
+
