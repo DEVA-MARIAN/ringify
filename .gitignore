@@ -39,3 +39,6 @@ next-env.d.ts
 
 # Temp audio files
 /tmp/ringify/
+
+.vercel
+.env*.local
