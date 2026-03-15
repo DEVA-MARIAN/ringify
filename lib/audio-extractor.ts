@@ -6,21 +6,14 @@ import os from 'os';
 
 const execFileAsync = promisify(execFile);
 
+export type PlatformName = 'YouTube' | 'Spotify' | 'SoundCloud' | 'Apple Music' | 'Instagram' | 'TikTok' | 'Unknown';
+
 export interface ExtractionResult {
   filePath: string;
   title: string;
   duration: number;
   platform: string;
 }
-
-export type PlatformName =
-  | 'YouTube'
-  | 'Spotify'
-  | 'SoundCloud'
-  | 'Apple Music'
-  | 'Instagram'
-  | 'TikTok'
-  | 'Unknown';
 
 const PLATFORM_PATTERNS: Array<{ name: PlatformName; pattern: RegExp }> = [
   { name: 'YouTube', pattern: /youtube\.com|youtu\.be/ },
@@ -38,92 +31,57 @@ export function detectPlatform(url: string): PlatformName {
 
 function getTempDir(): string {
   const dir = path.join(os.tmpdir(), 'ringify');
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+function getFfmpegPath(): string {
+  try {
+    const ffmpegStatic = require('ffmpeg-static');
+    if (ffmpegStatic && fs.existsSync(ffmpegStatic)) return ffmpegStatic;
+  } catch {}
+  return 'ffmpeg';
 }
 
 export async function extractAudio(url: string, outputId: string): Promise<ExtractionResult> {
   const tempDir = getTempDir();
   const outputTemplate = path.join(tempDir, `${outputId}.%(ext)s`);
   const finalMp3 = path.join(tempDir, `${outputId}.mp3`);
-
   const platform = detectPlatform(url);
+  const ffmpegPath = getFfmpegPath();
 
-  // yt-dlp arguments for highest quality audio, convert to mp3 320kbps
-  const args = [
-    url,
-    '--output', outputTemplate,
-    '--format', 'bestaudio/best',
-    '--extract-audio',
-    '--audio-format', 'mp3',
-    '--audio-quality', '0', // Best quality
-    '--no-playlist',
-    '--no-warnings',
-    '--print-json',
-    '--postprocessor-args', 'ffmpeg:-ar 44100 -b:a 320k',
-    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-  ];
+  // Use youtube-dl-exec which bundles yt-dlp as an npm package
+  const youtubeDl = require('youtube-dl-exec');
 
-  // For Spotify, Apple Music — yt-dlp can handle these via spotify/AM plugins
-  // or fallback to searching YouTube for the track name
-  if (platform === 'Spotify' || platform === 'Apple Music') {
-    args.push('--default-search', 'ytsearch1:');
-  }
+  const options: Record<string, any> = {
+    output: outputTemplate,
+    format: 'bestaudio/best',
+    extractAudio: true,
+    audioFormat: 'mp3',
+    audioQuality: 0,
+    noPlaylist: true,
+    noWarnings: true,
+    printJson: true,
+    ffmpegLocation: ffmpegPath,
+    postprocessorArgs: 'ffmpeg:-ar 44100 -b:a 320k',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+  };
 
   let metadata: any = {};
 
   try {
-    const { stdout } = await execFileAsync('yt-dlp', args, {
-      timeout: 120000,
-      maxBuffer: 10 * 1024 * 1024,
-    });
-
-    // Parse last JSON line
-    const lines = stdout.trim().split('\n').filter(Boolean);
-    for (let i = lines.length - 1; i >= 0; i--) {
-      try {
-        metadata = JSON.parse(lines[i]);
-        break;
-      } catch {
-        continue;
-      }
-    }
+    const result = await youtubeDl(url, options);
+    if (typeof result === 'object') metadata = result;
   } catch (err: any) {
-    // Some yt-dlp versions print JSON to stderr
-    const stderr = err.stderr || '';
-    const lines = stderr.trim().split('\n').filter(Boolean);
-    for (let i = lines.length - 1; i >= 0; i--) {
-      try {
-        metadata = JSON.parse(lines[i]);
-        break;
-      } catch {
-        continue;
-      }
-    }
-
-    // If file doesn't exist, it truly failed
+    // Check if file was created despite error
     if (!fs.existsSync(finalMp3)) {
-      // Try to find any mp3 that was created
       const files = fs.readdirSync(tempDir).filter(
         (f) => f.startsWith(outputId) && f.endsWith('.mp3')
       );
       if (files.length === 0) {
-        throw new Error(`Audio extraction failed: ${err.message || 'yt-dlp error'}`);
+        throw new Error(`Audio extraction failed: ${err.message || 'unknown error'}`);
       }
     }
-  }
-
-  // Find the actual output file
-  if (!fs.existsSync(finalMp3)) {
-    const files = fs.readdirSync(tempDir).filter(
-      (f) => f.startsWith(outputId) && (f.endsWith('.mp3') || f.endsWith('.m4a') || f.endsWith('.opus'))
-    );
-    if (files.length === 0) {
-      throw new Error('No audio file was created');
-    }
-    // If it's not already mp3, we'd need to convert — but yt-dlp with --audio-format mp3 should handle it
   }
 
   return {
@@ -135,13 +93,7 @@ export async function extractAudio(url: string, outputId: string): Promise<Extra
 }
 
 export function cleanupFile(filePath: string): void {
-  try {
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-  } catch {
-    // Ignore cleanup errors
-  }
+  try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
 }
 
 export function getTempFilePath(id: string, ext: string): string {
@@ -149,17 +101,9 @@ export function getTempFilePath(id: string, ext: string): string {
 }
 
 export function fileToBase64(filePath: string): string {
-  const buffer = fs.readFileSync(filePath);
-  return buffer.toString('base64');
+  return fs.readFileSync(filePath).toString('base64');
 }
 
 export function getFileSizeKB(filePath: string): number {
-  try {
-    const stats = fs.statSync(filePath);
-    return Math.round(stats.size / 1024);
-  } catch {
-    return 0;
-  }
+  try { return Math.round(fs.statSync(filePath).size / 1024); } catch { return 0; }
 }
-
-
