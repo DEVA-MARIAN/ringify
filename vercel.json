@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "buildCommand": "next build",
+  "buildCommand": "node scripts/download-ytdlp.js && next build",
   "devCommand": "next dev",
   "installCommand": "npm install",
   "framework": "nextjs",
@@ -26,5 +26,6 @@
     "NEXT_PUBLIC_APP_URL": "https://your-app.vercel.app"
   }
 }
+
 
 
